@@ -255,8 +255,71 @@
     todayEl.textContent = d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + week[d.getDay()];
   }
 
-  /* ---------- 存储 ---------- */
+  /* ---------- 存储（三层保险，专治 iOS 主屏幕 App 丢数据）----------
+     1. localStorage  —— 主存储，读取最快
+     2. IndexedDB     —— 备份存储，不易被 iOS 清理
+     3. 页面隐藏时立即落盘 —— 抓住"切后台"这个关键时刻
+     读取时取两者中"更新"的那份，写入时两边都写。            */
   var tasks = [];
+  var DB_NAME = 'daily_tasks_db';
+  var DB_STORE = 'kv';
+  var _db = null;
+  var _lastSaved = '';   // 上次成功保存的 JSON，用于比对谁更新
+  var _tsKey = 'daily_ts';
+
+  function openDB() {
+    return new Promise(function (resolve) {
+      try {
+        if (!window.indexedDB) { resolve(null); return; }
+        var req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = function (e) {
+          var db = e.target.result;
+          if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+        };
+        req.onsuccess = function (e) { _db = e.target.result; resolve(_db); };
+        req.onerror = function () { resolve(null); };
+        // 某些浏览器可能既不 success 也不 error，加个超时兜底
+        setTimeout(function () { resolve(_db); }, 1500);
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  function dbSet(key, val) {
+    try {
+      if (!_db) return;
+      var tx = _db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).put(val, key);
+    } catch (e) {}
+  }
+
+  function dbGet(key) {
+    return new Promise(function (resolve) {
+      try {
+        if (!_db) { resolve(null); return; }
+        var tx = _db.transaction(DB_STORE, 'readonly');
+        var req = tx.objectStore(DB_STORE).get(key);
+        req.onsuccess = function () { resolve(req.result || null); };
+        req.onerror = function () { resolve(null); };
+        setTimeout(function () { resolve(null); }, 1500);
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  /* 把当前状态写到两个地方 */
+  function persist() {
+    var json = JSON.stringify(tasks);
+    var date = todayStr();
+    var ts = Date.now();
+    _lastSaved = json;
+    try {
+      localStorage.setItem(STORE_KEY, json);
+      localStorage.setItem(DATE_KEY, date);
+      localStorage.setItem(_tsKey, String(ts));
+    } catch (e) {}
+    dbSet(STORE_KEY, json);
+    dbSet(DATE_KEY, date);
+    dbSet(_tsKey, ts);
+  }
 
   function load() {
     var rawTasks = null, rawDate = null;
@@ -269,25 +332,43 @@
       try { tasks = JSON.parse(rawTasks) || []; } catch (e) { tasks = []; }
     }
     if (!Array.isArray(tasks)) tasks = [];
-
-    tasks = tasks.filter(function (t) {
-      return t && typeof t === 'object' && typeof t.text === 'string' && t.text !== '';
-    }).map(function (t) {
-      return { id: t.id || uid(), text: t.text, done: !!t.done };
-    });
+    _lastSaved = rawTasks || '';
 
     // 跨天：任务保留，打卡状态全部重置
     if (rawDate !== todayStr()) {
       tasks.forEach(function (t) { t.done = false; });
-      save();
+      persist();
     }
   }
 
+  /* 启动时用 IndexedDB 的备份校验：如果它比 localStorage 新，就用它 */
+  function reconcile() {
+    return dbGet(STORE_KEY).then(function (dbTasks) {
+      if (!dbTasks) return;
+      var dbTs = null;
+      var rawTs = null;
+      try { rawTs = parseInt(localStorage.getItem(_tsKey) || '0', 10); } catch (e) { rawTs = 0; }
+      return dbGet(_tsKey).then(function (t) {
+        dbTs = parseInt(t || '0', 10);
+        if (!(dbTs > rawTs)) return;          // 备份不更新，忽略
+        var arr = null;
+        try { arr = JSON.parse(dbTasks); } catch (e) { return; }
+        if (!Array.isArray(arr) || arr.length === 0) return;
+        if (JSON.stringify(arr) === _lastSaved) return;
+        tasks = arr;
+        var d = null;
+        return dbGet(DATE_KEY).then(function (dd) {
+          d = dd;
+          if (d !== todayStr()) tasks.forEach(function (x) { x.done = false; });
+          persist();
+          render();
+        });
+      });
+    });
+  }
+
   function save() {
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(tasks));
-      localStorage.setItem(DATE_KEY, todayStr());
-    } catch (e) {}
+    persist();
   }
 
   function uid() {
@@ -388,9 +469,18 @@
     }, ms);
   }
 
-  /* 从后台切回前台时也检查一次日期（手机浏览器定时器可能被挂起） */
+  /* 切后台 / 页面隐藏时立即落盘 —— 这是 iOS 主屏幕 App 丢数据的关键时刻 */
+  function flushSave() {
+    try { persist(); } catch (e) {}
+  }
+
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState !== 'visible') return;
+    if (document.visibilityState === 'hidden') {
+      // 切后台：立刻写盘，抓住最后的保存机会
+      flushSave();
+      return;
+    }
+    // 切回前台：检查是否跨天
     if (localStorage.getItem(DATE_KEY) !== todayStr()) {
       tasks.forEach(function (t) { t.done = false; });
       save();
@@ -399,11 +489,23 @@
     }
   });
 
+  // pagehide / beforeunload 是 App 被划掉时最后能抓到的时机
+  window.addEventListener('pagehide', flushSave);
+  window.addEventListener('beforeunload', flushSave);
+  window.addEventListener('freeze', flushSave);
+
   /* ---------- 启动 ---------- */
   renderDate();
   load();
   render();
   scheduleMidnight();
+
+  // 等 IndexedDB 就绪后：先补写一次当前状态，再校验有没有更新的备份要用
+  openDB().then(function () {
+    return reconcile();
+  }).then(function () {
+    persist();          // 确保两边都有最新数据
+  });
 })();
 </script>
 </body>
